@@ -371,6 +371,8 @@ responses.
 BingIP
 ======
 
+**Note: Bing seems to have killed this. Lame.**
+
 BingIP resolves IP addresses to their associated domain names using Bing's
 [`ip:<ip address>` queries](https://searchenginewatch.com/sew/news/2051946/bing-allows-search-domains-single-ip-address).
 
