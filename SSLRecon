@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+
+import dns.resolver
+import urllib.parse
+import collections
+import traceback
+import itertools
+import argparse
+import socket
+import sys
+import ssl
+import os
+import re
+import OpenSSL.crypto as crypto
+
+import utils
+
+# defaults
+default_nameserver = '8.8.8.8'
+default_max_threads = 200
+default_timeout = 10.0
+default_ports = {443}
+
+def get_ssl_info(host, port, timeout=default_timeout, sni=None):
+    """
+    Get info from an SSL server
+
+    :param host: Host
+    :param port: Port
+    :param sni: Server Name Indication
+    :return: SSL info in the format {md5, sha1, sha256, subject: {ou, c, st, l, o, cn},
+                                     issuer: {ou, c, st, l, o, cn}}
+    """
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    sock = ctx.wrap_socket(socket.socket(), server_hostname=sni)
+    sock.settimeout(timeout)
+    sock.connect((host, port))
+    binary_cert = sock.getpeercert(binary_form=True)
+    # we have to use PyOpenSSL because for some reason the builtin Python ssl
+    # library returns an empty dictionary for the cert when verification is
+    # disabled...
+    cert = crypto.load_certificate(crypto.FILETYPE_ASN1, binary_cert)
+
+    #import pprint
+    #pprint.pprint(cert)
+
+    if not cert:
+        raise RuntimeError('Unable to parse cert')
+
+    subject = cert.get_subject().get_components()
+    issuer = cert.get_issuer().get_components()
+
+    result = {}
+
+    for digest in ('md5', 'sha1', 'sha256'):
+        result[digest] = cert.digest(digest).decode()
+
+    result['subject'] = {}
+    for key, value in subject:
+        key = key.decode().strip()
+        value = value.decode().strip()
+        result['subject'][key] = value
+
+    result['issuer'] = {}
+    for key, value in issuer:
+        key = key.decode().strip()
+        value = value.decode().strip()
+        result['issuer'][key] = value
+
+    return result
+
+    #print("CN=" + 
+    #subject = dict(x[0] for x in cert['subject'])
+    #issued_to = subject['commonName']
+    #issuer = dict(x[0] for x in cert['issuer'])
+    #issued_by = issuer['commonName']
+
+def pretty_dname(dn):
+    """
+    Make a pretty string for a DN
+
+    :param dn: DN in the format {part: value...}
+    :return: Pretty DN
+    """
+
+    parts = []
+    for key, value in dn.items():
+        parts.append('{}={}'.format(key, value))
+    return ' '.join(parts)
+
+def find_cnames(dn):
+    """
+    Find CNs in a DN
+
+    :param dn: DN to find CNs in in the format {part: value...}
+    :return: Set of CNs
+    """
+
+    ret = set()
+    for key, value in dn.items():
+        if key.lower() == 'cn':
+            ret.add(value.lower())
+
+    return ret
+
+def display_result(host, port, result, parent_items=None, verbose=False, cnames_only=False):
+    """
+    Display result from get_ssl_info()
+
+    :param host: Host
+    :param port: Port
+    :param result: Result
+    :param parent_items: Parent domains to associate hosts with
+    :param verbose: Verbose output
+    :param cnames_only: Only show cnames
+    """
+
+    if parent_items:
+        domain_note = ' ({})'.format(', '.join(parent_items[host])) if host in parent_items else ''
+    else:
+        domain_note = ''
+
+    if cnames_only:
+        for cname in find_cnames(result['subject']):
+            utils.log('{}:{} {}'.format(host, port, cname))
+    else:
+        utils.log('Host: {}:{}{}'.format(host, port, domain_note))
+
+        utils.log('Subject: {}'.format(pretty_dname(result['subject'])))
+        utils.log('Issuer: {}'.format(pretty_dname(result['issuer'])))
+
+        if verbose:
+            #utils.log('MD5: {}'.format(result['md5']))
+            utils.log('SHA1: {}'.format(result['sha1']))
+
+        utils.log()
+
+def main():
+    parser = argparse.ArgumentParser()
+    group = parser.add_argument_group('input arguments')
+    group.add_argument('item', nargs='*',
+            help='file containing ip[:port], domain[:port], or ip/cidr[:portrange]. portrange is an optional range of ports to check where "443,8441-8443" produces ports 443, 8441, 8442, and 8443. by default SSLRecon checks port 443')
+    group.add_argument('-f', '--file', action='append', help='file containing items, one on each line. see "item" argument')
+
+    group = parser.add_argument_group('dns arguments')
+    group.add_argument('-n', '--nameserver', default=[default_nameserver], action='append',
+            help='use these nameservers (default: {})'.format(default_nameserver))
+    group.add_argument('--system-nameservers', action='store_true',
+            help='use system nameservers')
+    group.add_argument('--tcp', action='store_true',
+            help='use tcp instead of udp for dns')
+
+    group = parser.add_argument_group('threading arguments')
+    group.add_argument('-t', '--max-threads', type=int, default=default_max_threads,
+            help='maximum number of threads to use at once (default: {})'.format(default_max_threads))
+    group.add_argument('-T', '--timeout', type=float, default=default_timeout,
+            help='SSL request timeout (default: {})'.format(default_timeout))
+
+    group = parser.add_argument_group('output arguments')
+    group.add_argument('--realtime', action='store_true',
+            help='print results in realtime. recommended for large ranges')
+    group.add_argument('--no-sni', action='store_true',
+            help='do not send server name indication (SNI). by default SSLRecon will send SNI if a domain name is passed')
+    group.add_argument('-s', '--sni',
+            help='send a specific server name indication (SNI). by default SSLRecon will send passed domain names as SNI and no SNI for IP addresses')
+    group.add_argument('-c', '--cnames', action='store_true', help='only print cnames (good for finding web servers)')
+    group.add_argument('-o', '--output', help='tee output to a file')
+    group.add_argument('-v', '--verbose', action='store_true', help='verbose output (show fingerprint)')
+    group.add_argument('-q', '--quiet', action='store_true', help='do not print status messages to stderr (including failure messages)')
+    group.add_argument('-D', '--debug', action='store_true', help='enable debug output')
+    args = parser.parse_args()
+
+    # -D/--debug
+    if args.debug:
+        # enable debug messages
+        utils.enable_debug()
+
+    # -q/--quiet
+    if args.quiet:
+        # disable prefixed stderr messages
+        utils.disable_status()
+
+    # -o/--output
+    if args.output:
+        # set log file
+        utils.set_log(args.output)
+
+    # check to make sure --sni and --no-sni are not passed together
+    if args.sni and args.no_sni:
+        utils.die('-s/--sni and --no-sni are not compatible')
+
+    # --system-nameservers
+    if not args.system_nameservers:
+        # -n/--nameserver
+        dns.resolver.default_resolver = dns.resolver.Resolver(configure=False)
+        dns.resolver.default_resolver.nameservers = args.nameserver
+        dns.resolver.default_resolver.rotate = True
+
+    items = set()
+
+    # <item>
+    if args.item:
+        items |= set(args.item)
+
+    # -f/--file
+    items |= set(utils.file_items(args.file))
+
+    if not items:
+        utils.die('Provide some domain names, IP addresses, or CIDR ranges')
+
+    # iter((ip, {port...})...)
+    hosts = iter([])
+    # {ip: set(parent_domain...)}
+    parent_items = collections.defaultdict(set)
+
+    def resolve_items(items):
+        for ip, item, ports in utils.resolve_to_ips(items, parse_ports=True,
+                                                    tcp=args.tcp):
+            # track parent items
+            if ip != item:
+                parent_items[ip].add(item)
+
+            # handle errors
+            if isinstance(ip, Exception):
+                exception = ip
+                utils.bad('Failed to resolve {}: {}'.format(item, str(exception)))
+                utils.debug_exception(exception)
+                continue
+
+            # set default ports
+            if not ports:
+                ports = default_ports
+
+            # yield all (host, port) pairs
+            for port in ports:
+                yield (ip, port)
+
+    pairs = resolve_items(items)
+
+    def thread_helper(pair):
+        host, port = pair
+
+        # set SNI if needed
+        sni = None
+        if args.sni:
+            # -s/--sni
+            sni = args.sni
+        elif not args.no_sni and host in parent_items:
+            # --no-sni
+            for parent in parent_items[host]:
+                if not utils.is_cidr(parent):
+                    sni = parent
+                    break
+
+        return get_ssl_info(host, port, sni=sni)
+
+    total_results = 0
+    for pair, result in utils.threadify(thread_helper, pairs,
+            max_threads=args.max_threads):
+        host, port = pair
+
+        if isinstance(result, Exception):
+            utils.bad('SSL recon for {}:{} failed: {}'.format(host, port, str(result)))
+            utils.debug_exception(result)
+        else:
+            display_result(host, port, result,
+                    parent_items=parent_items, verbose=args.verbose,
+                    cnames_only=args.cnames)
+            total_results += 1
+
+    if total_results:
+        # display total
+        utils.good('Gathered info on {} SSL servers'.format(total_results))
+    else:
+        # no results
+        utils.bad('No SSL servers contacted successfully')
+
+if __name__ == '__main__':
+    main()

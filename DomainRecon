@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+
+import collections
+import tldextract
+import traceback
+import itertools
+import datetime
+import argparse
+import pprint
+import whois
+import sys
+import os
+import re
+
+import utils
+
+# defaults
+default_max_threads = 6
+
+def get_whois(domain):
+    """
+    Get whois info for a domain
+
+    :param domain: Domain to get info for
+    :return: Dictionary containing domain info in the format {registrar, org, name
+    emails, country, creation, expiration}
+    """
+
+    # clean up domain (remove subdomain and url parts)
+    extracted = tldextract.extract(domain)
+    main_domain = '{}.{}'.format(extracted.domain, extracted.suffix)
+    if main_domain != domain:
+        utils.debug('Replaced {} with {}'.format(domain, main_domain))
+
+    result = whois.whois(main_domain)
+
+    # debug
+    utils.debug('IPWhois result:')
+    utils.debug(pprint.pformat(result))
+
+    # grab these keys
+    # {key: dest}
+    keys = {
+        'registrar': None,
+        'org': 'organization',
+        'name': 'registrant',
+        'emails': None,
+        'country': None,
+        'creation_date': 'expiration',
+        'expiration_date': 'expiration',
+        'name_servers': None,
+        'registrant_email': 'emails',
+        'registrant_name': 'name',
+        'registrant_country': 'country',
+    }
+
+    # convert these to lowercase
+    lower = (
+        'emails',
+        'name_servers',
+    )
+
+    # reduce the number of these
+    prune_dates = (
+        'expiration',
+        'creation',
+    )
+
+    # grab the info we want
+    domain_info = collections.defaultdict(list)
+    for key, dest in keys.items():
+        # ignore empty or non-existent values
+        if not (key in result and result[key]):
+            continue
+
+        if not dest:
+            # default destination is same as key
+            dest = key
+
+        if not isinstance(result[key], list):
+            # result is a list of values
+            values = [result[key]]
+        else:
+            # result is a single value
+            values = result[key]
+
+        # fix up values
+        new_values = []
+        for value in values:
+            if isinstance(value, datetime.datetime):
+                # it's a date
+                value = str(value.date())
+            else:
+                # any other value
+                value = str(value)
+
+            # strip
+            value = value.strip()
+
+            # lowercase
+            if dest in lower:
+                value = value.lower()
+
+            new_values.append(value)
+        values = new_values
+
+        # sort unique values
+        values = sorted(list(set(values)))
+
+        domain_info[dest] += values
+
+    if domain_info:
+        return domain_info
+    else:
+        return None
+
+def main():
+    parser = argparse.ArgumentParser()
+    group = parser.add_argument_group('input arguments')
+    group.add_argument('domain', nargs='*',
+            help='Domain names')
+    group.add_argument('-f', '--file', action='append',
+            help='file containing domain names')
+    group.add_argument('--append', action='append',
+            help='try appending these strings to each domain')
+    group.add_argument('-t', '--tld', action='append',
+            help='add these TLDs (comma-separated or multiple-argument)')
+
+    group = parser.add_argument_group('threading arguments')
+    group.add_argument('-j', '--max-threads', type=int, default=default_max_threads,
+            help='maximum number of threads to use at once (default: {})'.format(default_max_threads))
+
+    group = parser.add_argument_group('output arguments')
+    group.add_argument('-e', '--expirations', action='store_true',
+            help='only show domain expirations')
+    group.add_argument('-a', '--available', action='store_true',
+            help='only show domains that are available')
+    group.add_argument('-o', '--output',
+            help='tee output to a file')
+    group.add_argument('-q', '--quiet', action='store_true',
+            help='do not print status messages to stderr')
+    group.add_argument('-D', '--debug', action='store_true',
+            help='enable debug output')
+    group.add_argument('-c', '--check', action='store_true',
+            help='check domain registration status')
+    args = parser.parse_args()
+
+    # -D/--debug
+    if args.debug:
+        # enable debug messages
+        utils.enable_debug()
+
+    # -q/--quiet
+    if args.quiet:
+        # disable prefixed stderr messages
+        utils.disable_status()
+
+    # -o/--output
+    if args.output:
+        # set log file
+        utils.set_log(args.output)
+
+    domains = iter(())
+
+    # <domain>
+    if args.domain:
+        domains = iter(args.domain)
+
+    # -f/--file
+    domains = itertools.chain(domains, utils.file_items(args.file))
+
+    # check to make sure we got domains
+    domains = utils.check_iterator(domains)
+    if not domains:
+        utils.die('Provide some domains to perform recon on.')
+
+    # add permutations
+    if args.append:
+        def append_generator(domains):
+            for domain in domains:
+                yield domain
+                for append in utils.combine_comma_lists(args.append):
+                    yield domain + append
+
+        domains = append_generator(domains)
+
+    # add TLDs
+    if args.tld:
+        def tld_generator(domains):
+            for domain in domains:
+                for tld in utils.combine_comma_lists(args.tld):
+                    tld = tld.lstrip('.')
+                    yield '{}.{}'.format(domain, tld)
+
+        domains = tld_generator(domains)
+
+    total_results = 0
+    for domain, result in utils.threadify(get_whois, domains, max_threads=args.max_threads):
+        if args.available:
+            # handle exceptions
+            if isinstance(result, whois.parser.PywhoisError) and 'No match for' in str(result).splitlines()[0]:
+                utils.log(domain)
+            elif isinstance(result, Exception):
+                utils.debug_exception(result)
+                utils.bad('{} failed'.format(domain))
+            else:
+                # registered
+                pass
+        elif args.expirations:
+            # handle exceptions
+            if isinstance(result, whois.parser.PywhoisError) and 'No match for' in str(result):
+                utils.log('{}: unregistered'.format(domain))
+            elif isinstance(result, Exception):
+                utils.debug_exception(result)
+                utils.log('{}: failed'.format(domain))
+            elif result is None:
+                utils.log('{}: no results'.format(domain))
+            else:
+                utils.log('{}: {}'.format(domain, ', '.join(result['expiration'])))
+        else:
+            # show all info
+            utils.log('Domain: {}'.format(domain))
+
+            # debug
+            utils.debug('Final result:')
+            utils.debug(pprint.pformat(result))
+
+            # handle exceptions
+            if isinstance(result, Exception):
+                utils.debug_exception(result)
+                utils.log('Failure: {}\n'.format(str(result).splitlines()[0]))
+                continue
+            elif result is None:
+                utils.log('Unregistered')
+                continue
+            else:
+                # display results
+                for key, values in result.items():
+                    value = ', '.join(values)
+
+                    # replace _ with space
+                    pretty = key.replace('_', ' ')
+                    # uppercase first letter
+                    pretty = pretty[0].upper() + pretty[1:]
+
+                    if value:
+                        utils.log('{}: {}'.format(pretty, value))
+
+                utils.log()
+                total_results += 1
+
+    if not args.expirations:
+        if total_results:
+            # print total
+            utils.good('Retrieved whois info for {} domains'.format(total_results))
+        else:
+            # nothing found
+            utils.bad('All whois queries failed')
+
+if __name__ == '__main__':
+    main()

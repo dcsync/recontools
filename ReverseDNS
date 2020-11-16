@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+
+import dns.resolver
+import urllib.parse
+import collections
+import traceback
+import itertools
+import argparse
+import copy
+import sys
+import os
+import re
+
+import utils
+
+# defaults
+default_nameserver = '8.8.8.8'
+default_max_threads = 300
+
+def main():
+    parser = argparse.ArgumentParser()
+    group = parser.add_argument_group('input arguments')
+    group.add_argument('item', nargs='*', help='IP address, CIDR range, or domain name to perform recon on')
+    group.add_argument('-f', '--file', action='append', help='file containing IP addresses, CIDR ranges, and/or domain names to perform recon on')
+
+    group = parser.add_argument_group('dns arguments')
+    group.add_argument('-n', '--nameserver', default=[default_nameserver], action='append',
+            help='use these nameservers (default: {})'.format(default_nameserver))
+    group.add_argument('--system-nameservers', action='store_true',
+            help='use system nameservers')
+    group.add_argument('-T', '--tcp', action='store_true',
+            help='use tcp instead of udp for dns')
+
+    group = parser.add_argument_group('threading arguments')
+    group.add_argument('-t', '--max-threads', type=int, default=default_max_threads,
+            help='maximum number of threads to use at once (default: {})'.format(default_max_threads))
+
+    group = parser.add_argument_group('output arguments')
+    group.add_argument('-o', '--output', help='tee output to a file')
+    group.add_argument('-q', '--quiet', action='store_true', help='do not print status messages to stderr')
+    group.add_argument('-D', '--debug', action='store_true', help='enable debug output')
+    args = parser.parse_args()
+
+    # -D/--debug
+    if args.debug:
+        # enable debug messages
+        utils.enable_debug()
+
+    # -q/--quiet
+    if args.quiet:
+        # disable prefixed stderr messages
+        utils.disable_status()
+
+    # -o/--output
+    if args.output:
+        # set log file
+        utils.set_log(args.output)
+
+    # --system-nameservers
+    if not args.system_nameservers:
+        # -n/--nameserver
+        dns.resolver.default_resolver = dns.resolver.Resolver(configure=False)
+        dns.resolver.default_resolver.nameservers = args.nameserver
+        dns.resolver.default_resolver.rotate = True
+
+    items = set()
+
+    # <item>
+    if args.item:
+        items |= set(args.item)
+
+    # -f/--file
+    items |= set(utils.file_items(args.file))
+
+    if not items:
+        utils.die('Provide some domain names, IP addresses, or CIDR ranges')
+
+    # {ip: set(parent_domain...)}
+    parent_domains = collections.defaultdict(set)
+
+    def resolve_items(items):
+        for ip, item, ports in utils.resolve_to_ips(items, tcp=args.tcp):
+            # track parent items
+            if ip != item and not utils.is_cidr(item):
+                parent_domains[ip].add(item)
+
+            # handle errors
+            if isinstance(ip, Exception):
+                exception = ip
+                utils.bad('Failed to resolve {}: {}'.format(item, str(exception)))
+                utils.debug_exception(exception)
+                continue
+
+            yield ip
+
+    ips = resolve_items(items)
+
+    # threadpool helper
+    def thread_helper(ip):
+        # -t/--tcp
+        result = utils.rdns(ip, tcp=args.tcp)
+        return result
+
+    total_results = 0
+    for ip, result in utils.threadify(thread_helper, ips, max_threads=args.max_threads):
+        if isinstance(result, Exception):
+            # this is a nameserver error, not a 'no response' scenario
+            utils.bad('RDNS for IP {} failed: {}'.format(ip, str(result)))
+            utils.debug_exception(result)
+        else:
+            if result:
+                out = ip
+                if ip in parent_domains:
+                    out += ' ({})'.format(', '.join(parent_domains[ip]))
+                out += ': {}'.format(result)
+                utils.log(out)
+
+                total_results += 1
+
+    if total_results:
+        # display results
+        utils.good('Found {} PTR record(s)'.format(total_results))
+    else:
+        # no results
+        utils.bad('No PTR records found')
+
+if __name__ == '__main__':
+    main()

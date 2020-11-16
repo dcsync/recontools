@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+
+import dns.resolver
+import collections
+import itertools
+import threading
+import traceback
+import argparse
+import time
+import sys
+import os
+import re
+
+# library dnspython
+import dns.resolver
+
+import utils
+
+# defaults
+default_max_threads = 50
+default_nameservers = ['1.1.1.1', '8.8.8.8']
+
+# known email hosting domains
+known_domains = {
+    # to sort this dict: sort -u | sort -t: -k2
+    '.1and1.co.uk': '1and1',
+    '.1and1.com': '1and1',
+    '.1and1.de': '1and1',
+    '.1and1.es': '1and1',
+    '.1and1.fr': '1and1',
+    '.1and1.mx': '1and1',
+    '.kundenserver.de': '1and1',
+    '.mail.com': '1and1',
+    '.above.com': 'above.com',
+    '.amazonaws.com': 'amazon',
+    '.arsmtp.com': 'appriver',
+    '.prodigy.net': 'at&t',
+    '.atos.net': 'atos',
+    '.barracudanetworks.com': 'barracuda',
+    '.cisco.com': 'cisco',
+    '.iphmx.com': 'cisco',
+    '.cock.li': 'cock.li',
+    '.comcast.net': 'comcast',
+    'dreamhost.com': 'dreamhost',
+    '.mailhop.co': 'duocircle',
+    '.mailhop.co.uk': 'duocircle',
+    '.mailhop.org': 'duocircle',
+    '.mailhop.us': 'duocircle',
+    '.rcimx.com': 'edgewave',
+    '.rcimx.net': 'edgewave',
+    '.epik.com': 'epik',
+    '.messagingengine.com': 'fastmail',
+    '.fireeyecloud.com': 'fireeye',
+    '.mailcontrol.com': 'forcepoint',
+    '.gandi.net': 'gandi',
+    '.gmx.net': 'gmx',
+    '.domainsbyproxy.com': 'godaddy',
+    '.secureserver.net': 'godaddy',
+    '.google.com': 'google',
+    '.googlemail.com': 'google',
+    '.h-email.net': 'h-net',
+    '.hostedemail.com': 'hostedemail',
+    '.hotmail.com': 'hotmail',
+    '.hushmail.com': 'hushmail',
+    '.icewarpcloud.in': 'icewarpcloud',
+    '.icloud.com': 'icloud',
+    '.topdns.com': 'internetbs',
+    '.megamailservers.com': 'internetnamesforbusiness',
+    '.mail.ru': 'mail.ru',
+    '.mailinator.com': 'mailinator',
+    '.cloudfilter.net': 'mailprotector',
+    '.mimecast-offshore.com': 'mimecast',
+    '.mimecast.co.za': 'mimecast',
+    '.mimecast.com': 'mimecast',
+    '.namebrightmail.com': 'namebright',
+    '.privateemail.com': 'namecheap',
+    '.registrar-servers.com': 'namecheap',
+    '.web-hosting.com': 'namecheap',
+    '.emailowl.com': 'namesilo',
+    '.netease.com': 'netease',
+    'netnames.net': 'netnames',
+    '.serverdata.net': 'networksolutions',
+    'nicmail.ru': 'nic',
+    '.outlook.cn': 'office365',
+    '.outlook.com': 'office365',
+    '.outlook.de': 'office365',
+    '.one.com': 'one.com',
+    '.ovh.net': 'ovh',
+    'pandasecurity.com': 'pandasecurity',
+    '.webfaction.com': 'paragon',
+    '.ppe-hosted.com': 'proofpoint',
+    '.pphosted.com': 'proofpoint',
+    '.ppsmtp.de': 'proofpoint',
+    '.ppsmtp.net': 'proofpoint',
+    '.protonmail.ch': 'protonmail',
+    '.emailsrvr.com': 'rackspace',
+    '.safe-mail.net': 'safe-mail',
+    '.seznam.cz': 'seznam',
+    '.shawcable.net': 'shaw',
+    '.mailspamprotection.com': 'singlehop',
+    'smxemail.com': 'smx',
+    '.spamexperts.com': 'spamexperts',
+    '.spamexperts.eu': 'spamexperts',
+    '.spamexperts.net': 'spamexperts',
+    '.startmail.com': 'startmail',
+    '.rzone.de': 'strato',
+    '.messagelabs.com': 'symantec',
+    '.synaq.com': 'synaq',
+    '.t-online.de': 't-online',
+    '.qq.com': 'tencent',
+    '.trendmicro.com': 'trendmicro',
+    '.trendmicro.eu': 'trendmicro',
+    '.tutanota.de': 'tutanota',
+    '.rr.com': 'twc',
+    '.verizonbusiness.com': 'verizon',
+    '.spamfree.cz': 'virusfree',
+    '.virusfree.cz': 'virusfree',
+    'vodafonemail.xion.oxcs.net': 'vodafone',
+    '.web.de': 'web.de',
+    '.yahoo.co.jp': 'yahoo',
+    '.yahoodns.net': 'yahoo',
+    '.yandex.net': 'yandex',
+    '.yandex.ru': 'yandex',
+    '.yopmail.com': 'yopmail',
+    '.as9143.net': 'ziggo',
+    '.zoho.com': 'zoho',
+    '.zoho.eu': 'zoho',
+    '.zohomail.com': 'zoho',
+}
+
+# known security products
+known_security = [
+    'appriver',
+    'barracuda',
+    'cisco',
+    'duocircle',
+    'edgewave',
+    'fireeye',
+    'forcepoint',
+    'google',
+    'mimecast',
+    'office365',
+    'proofpoint',
+    'symantec',
+    'trendmicro',
+]
+
+def get_domain(item):
+    if '@' in item:
+        # email address
+        return item.split('@')[-1]
+    else:
+        # domain
+        return item
+
+def identify_hosters(item, tcp=False, mx=True, spf=False, dmarc=False):
+    """
+    Identify the mail hosters for a domain or email address.
+
+    :param item: Domain or email address
+    :param tcp: Use TCP instead of UDP for DNS
+    :param mx: Get MX (hoster) info
+    :param dmarc: Get DMARC info
+    :param spf: Get SPF info
+    :return: Results in the format {mx, spf, dmarc}
+    """
+
+    # get the domain if it's an email address
+    domain = get_domain(item)
+    domain = domain.lower()
+
+    result = {}
+
+    # get MX 
+    if mx:
+        result['mx'] = collections.defaultdict(set)
+        response = dns.resolver.query(domain, 'MX', tcp=tcp)
+        for record in response:
+            record = record.to_text().split(' ')[-1].strip().lower().rstrip('.')
+            for hoster_domain, hoster in known_domains.items():
+                if record.endswith(hoster_domain):
+                    hoster_name = hoster
+                    break
+            else:
+                if record == domain or record.endswith('.' + domain):
+                    # handled by own domain
+                    hoster_name = 'self-hosted'
+                else:
+                    hoster_name = 'unknown'
+
+            result['mx'][hoster_name].add(record)
+
+    # get SPF
+    if spf:
+        result['spf'] = None
+        try:
+            response = dns.resolver.query(domain, 'TXT', tcp=tcp)
+            for record in response:
+                record = record.to_text().lower().strip('" ')
+                if record.startswith('v=spf'):
+                    result['spf'] = ' '.join(record.split(' ')[1:])
+        except dns.resolver.NoAnswer:
+            # no answer means no DMARC
+            pass
+
+    # get DMARC
+    if dmarc:
+        result['dmarc'] = None
+        try:
+            response = dns.resolver.query('_dmarc.' + domain, 'TXT', tcp=tcp)
+            for record in response:
+                record = record.to_text().lower().strip('" ')
+                if record.startswith('v=dmarc'):
+                    result['dmarc'] = ';'.join(record.split(';')[1:]).strip()
+        except dns.resolver.NoAnswer:
+            # no answer means no DMARC
+            pass
+
+    return result
+
+def display_result(item, result, ignore_failed=False, highlight_security=False,
+        verbose=False):
+    """
+    Display a result from identify_hosters().
+
+    :param item: Original domain or email address
+    :param result: Result
+    :param ignore_failed: Don't show failed queries
+    :param highlight_security: Show a prefix for known security products
+    :param verbose: Show all MX records (verbose)
+    """
+
+    if isinstance(result, Exception):
+        utils.debug_exception(result)
+        if ignore_failed:
+            output = None
+        else:
+            output = '{} failed: {}'.format(item, str(result))
+    else:
+        output = '{}:'.format(item)
+
+        # display MX
+        if 'mx' in result:
+            # detect security ones
+            security = False
+            for hoster in result['mx']:
+                if hoster in known_security:
+                    security = True
+                    break
+
+            output += ' {}'.format(','.join(result['mx'].keys()))
+
+            if security and highlight_security:
+                # highlight security ones
+                output += ' (security!)'
+
+            records_to_display = set()
+
+            if verbose:
+                # show all records
+                for name, records in result['mx'].items():
+                    records_to_display |= records
+            else:
+                # show unknown records
+                if 'unknown' in result.keys():
+                    records_to_display |= result['mx']['unknown']
+
+            if records_to_display:
+                output += ' (MX: {})'.format(' '.join(records_to_display))
+        
+        # display SPF
+        if 'spf' in result:
+            if result['spf']:
+                if verbose:
+                    output += ' (SPF: {})'.format(result['spf'])
+                else:
+                    output += ' (SPF)'
+            else:
+                output += ' (no SPF)'
+
+        # display DMARC
+        if 'dmarc' in result:
+            if result['dmarc']:
+                if verbose:
+                    output += ' (DMARC: {})'.format(result['dmarc'])
+                else:
+                    output += ' (DMARC)'
+            else:
+                output += ' (no DMARC)'
+
+
+    if output:
+        utils.log(output)
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    # main options
+    group = parser.add_argument_group('input arguments')
+    group.add_argument('-f', '--file', action='append',
+            help='file containing domains or email addresses to check')
+    group.add_argument('item', nargs='*',
+            help='domain or email address to check')
+
+    group = parser.add_argument_group('request arguments')
+    group.add_argument('--no-mx', action='store_true',
+            help="Don't get MX (hoster) info")
+    group.add_argument('-s', '--spf', action='store_true',
+            help="Get SPF info")
+    group.add_argument('-d', '--dmarc', action='store_true',
+            help="Get DMARC info")
+
+    group = parser.add_argument_group('threading arguments')
+    group.add_argument('-t', '--max-threads', type=int, default=default_max_threads,
+            help='maximum number of checking threads (default: {})'.format(default_max_threads))
+
+    group = parser.add_argument_group('dns arguments')
+    group.add_argument('-n', '--nameserver', default=default_nameservers, action='append',
+            help='use these nameservers (default: {})'.format(', '.join(default_nameservers)))
+    group.add_argument('--system-nameserver', action='store_true',
+            help='use system nameserver')
+    group.add_argument('-T', '--tcp', action='store_true',
+            help='use tcp instead of udp for dns')
+
+    group = parser.add_argument_group('other arguments')
+    group.add_argument('-l', '--list', action='store_true',
+            help='list known email hosters and exit')
+
+    group = parser.add_argument_group('output arguments')
+    group.add_argument('--highlight-security', action='store_true',
+            help='highlight security hosters')
+    group.add_argument('--ignore-failed', action='store_true',
+            help='do not show failed queries')
+    group.add_argument('-o', '--output', help='tee output to a file')
+    group.add_argument('-q', '--quiet', action='store_true', help='do not print status messages to stderr')
+    group.add_argument('-v', '--verbose', action='store_true',
+            help='verbose mode')
+    group.add_argument('-D', '--debug', action='store_true',
+            help='debug mode')
+
+    args = parser.parse_args()
+
+    if not (not args.no_mx or args.spf or args.dmarc):
+        utils.die('you must use --spf or --dmarc with --no-mx')
+
+    # --system-nameserver
+    if not args.system_nameserver:
+        # -n/--nameserver
+        dns.resolver.default_resolver = dns.resolver.Resolver(configure=False)
+        dns.resolver.default_resolver.nameservers = args.nameserver
+        dns.resolver.default_resolver.rotate = True
+
+    # -D/--debug
+    if args.debug:
+        # enable debug messages
+        utils.enable_debug()
+
+    # -q/--quiet
+    if args.quiet:
+        # disable prefixed stderr messages
+        utils.disable_status()
+
+    # -o/--output
+    if args.output:
+        # set log file
+        utils.set_log(args.output)
+
+    # -l/--list
+    if args.list:
+        # group by hoster
+        by_hoster = collections.defaultdict(set)
+        for domain, hoster in known_domains.items():
+            by_hoster[hoster].add(domain)
+
+        # print them
+        for hoster, domains in by_hoster.items():
+            utils.log('{}: {}'.format(hoster, ' '.join(domains)))
+
+        sys.exit(0)
+
+    items = iter(())
+
+    # item
+    if args.item:
+        utils.debug('Adding {} items(s) from argument'.format(len(args.item)))
+        items = iter(args.item)
+
+    # -f/--file
+    items = itertools.chain(items, utils.file_items(args.file))
+
+    # make sure we got some items
+    items = utils.check_iterator(items)
+    if not items:
+        utils.die('Provide some domains or email addresses to check')
+
+    def thread_helper(item):
+        return identify_hosters(item, tcp=args.tcp, mx=not args.no_mx,
+                spf=args.spf, dmarc=args.dmarc)
+
+    for item, result in utils.threadify(thread_helper, items, max_threads=args.max_threads):
+        display_result(item, result,
+                ignore_failed=args.ignore_failed,
+                highlight_security=args.highlight_security,
+                verbose=args.verbose)
+
+if __name__ == '__main__':
+    main()
