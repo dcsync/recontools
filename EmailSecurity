@@ -174,7 +174,7 @@ def identify_hosters(item, tcp=False, mx=True, spf=False, dmarc=False):
     # get MX 
     if mx:
         result['mx'] = collections.defaultdict(set)
-        response = dns.resolver.query(domain, 'MX', tcp=tcp)
+        response = dns.resolver.resolve(domain, 'MX', tcp=tcp)
         for record in response:
             record = record.to_text().split(' ')[-1].strip().lower().rstrip('.')
             for hoster_domain, hoster in known_domains.items():
