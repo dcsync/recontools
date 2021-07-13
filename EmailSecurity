@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
 
-import dns.resolver
+import argparse
 import collections
 import itertools
-import threading
-import traceback
-import argparse
-import time
 import sys
-import os
-import re
 
 # library dnspython
 import dns.resolver
@@ -145,6 +139,7 @@ known_security = [
     'trendmicro',
 ]
 
+
 def get_domain(item):
     if '@' in item:
         # email address
@@ -152,6 +147,7 @@ def get_domain(item):
     else:
         # domain
         return item
+
 
 def identify_hosters(item, tcp=False, mx=True, spf=False, dmarc=False):
     """
@@ -171,7 +167,7 @@ def identify_hosters(item, tcp=False, mx=True, spf=False, dmarc=False):
 
     result = {}
 
-    # get MX 
+    # get MX
     if mx:
         result['mx'] = collections.defaultdict(set)
         response = dns.resolver.resolve(domain, 'MX', tcp=tcp)
@@ -194,7 +190,7 @@ def identify_hosters(item, tcp=False, mx=True, spf=False, dmarc=False):
     if spf:
         result['spf'] = None
         try:
-            response = dns.resolver.query(domain, 'TXT', tcp=tcp)
+            response = dns.resolver.resolve(domain, 'TXT', tcp=tcp)
             for record in response:
                 record = record.to_text().lower().strip('" ')
                 if record.startswith('v=spf'):
@@ -207,7 +203,7 @@ def identify_hosters(item, tcp=False, mx=True, spf=False, dmarc=False):
     if dmarc:
         result['dmarc'] = None
         try:
-            response = dns.resolver.query('_dmarc.' + domain, 'TXT', tcp=tcp)
+            response = dns.resolver.resolve('_dmarc.' + domain, 'TXT', tcp=tcp)
             for record in response:
                 record = record.to_text().lower().strip('" ')
                 if record.startswith('v=dmarc'):
@@ -218,8 +214,9 @@ def identify_hosters(item, tcp=False, mx=True, spf=False, dmarc=False):
 
     return result
 
+
 def display_result(item, result, ignore_failed=False, highlight_security=False,
-        verbose=False):
+                   verbose=False):
     """
     Display a result from identify_hosters().
 
@@ -267,7 +264,7 @@ def display_result(item, result, ignore_failed=False, highlight_security=False,
 
             if records_to_display:
                 output += ' (MX: {})'.format(' '.join(records_to_display))
-        
+
         # display SPF
         if 'spf' in result:
             if result['spf']:
@@ -288,9 +285,9 @@ def display_result(item, result, ignore_failed=False, highlight_security=False,
             else:
                 output += ' (no DMARC)'
 
-
     if output:
         utils.log(output)
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -298,45 +295,45 @@ def main():
     # main options
     group = parser.add_argument_group('input arguments')
     group.add_argument('-f', '--file', action='append',
-            help='file containing domains or email addresses to check')
+                       help='file containing domains or email addresses to check')
     group.add_argument('item', nargs='*',
-            help='domain or email address to check')
+                       help='domain or email address to check')
 
     group = parser.add_argument_group('request arguments')
     group.add_argument('--no-mx', action='store_true',
-            help="Don't get MX (hoster) info")
+                       help="Don't get MX (hoster) info")
     group.add_argument('-s', '--spf', action='store_true',
-            help="Get SPF info")
+                       help="Get SPF info")
     group.add_argument('-d', '--dmarc', action='store_true',
-            help="Get DMARC info")
+                       help="Get DMARC info")
 
     group = parser.add_argument_group('threading arguments')
     group.add_argument('-t', '--max-threads', type=int, default=default_max_threads,
-            help='maximum number of checking threads (default: {})'.format(default_max_threads))
+                       help='maximum number of checking threads (default: {})'.format(default_max_threads))
 
     group = parser.add_argument_group('dns arguments')
     group.add_argument('-n', '--nameserver', default=default_nameservers, action='append',
-            help='use these nameservers (default: {})'.format(', '.join(default_nameservers)))
+                       help='use these nameservers (default: {})'.format(', '.join(default_nameservers)))
     group.add_argument('--system-nameserver', action='store_true',
-            help='use system nameserver')
+                       help='use system nameserver')
     group.add_argument('-T', '--tcp', action='store_true',
-            help='use tcp instead of udp for dns')
+                       help='use tcp instead of udp for dns')
 
     group = parser.add_argument_group('other arguments')
     group.add_argument('-l', '--list', action='store_true',
-            help='list known email hosters and exit')
+                       help='list known email hosters and exit')
 
     group = parser.add_argument_group('output arguments')
     group.add_argument('--highlight-security', action='store_true',
-            help='highlight security hosters')
+                       help='highlight security hosters')
     group.add_argument('--ignore-failed', action='store_true',
-            help='do not show failed queries')
+                       help='do not show failed queries')
     group.add_argument('-o', '--output', help='tee output to a file')
     group.add_argument('-q', '--quiet', action='store_true', help='do not print status messages to stderr')
     group.add_argument('-v', '--verbose', action='store_true',
-            help='verbose mode')
+                       help='verbose mode')
     group.add_argument('-D', '--debug', action='store_true',
-            help='debug mode')
+                       help='debug mode')
 
     args = parser.parse_args()
 
@@ -395,13 +392,14 @@ def main():
 
     def thread_helper(item):
         return identify_hosters(item, tcp=args.tcp, mx=not args.no_mx,
-                spf=args.spf, dmarc=args.dmarc)
+                                spf=args.spf, dmarc=args.dmarc)
 
     for item, result in utils.threadify(thread_helper, items, max_threads=args.max_threads):
         display_result(item, result,
-                ignore_failed=args.ignore_failed,
-                highlight_security=args.highlight_security,
-                verbose=args.verbose)
+                       ignore_failed=args.ignore_failed,
+                       highlight_security=args.highlight_security,
+                       verbose=args.verbose)
+
 
 if __name__ == '__main__':
     main()

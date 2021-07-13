@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 
-import dns.resolver
+import argparse
 import collections
+import random
 import threading
 import traceback
-import argparse
+
+import dns.resolver
 import ipwhois
-import random
-import sys
-import os
-import re
 
 import utils
 
 # defaults
 default_nameserver = '8.8.8.8'
 default_max_threads = 6
+
 
 def get_range_info(ip):
     """
@@ -38,7 +37,7 @@ def get_range_info(ip):
     result = whois.lookup_rdap(asn_methods=['dns', 'whois', 'http'])
 
     #import pprint
-    #pprint.pprint(result)
+    # pprint.pprint(result)
 
     asn_info = {'asn_cidr': result['asn_cidr'],
                 'asn_description': result['asn_description'],
@@ -64,6 +63,7 @@ def get_range_info(ip):
 
     return asn_info
 
+
 def main():
     parser = argparse.ArgumentParser()
     group = parser.add_argument_group('input arguments')
@@ -72,15 +72,15 @@ def main():
 
     group = parser.add_argument_group('dns arguments')
     group.add_argument('-n', '--nameserver', default=[default_nameserver], action='append',
-            help='use these nameservers (default: {})'.format(default_nameserver))
+                       help='use these nameservers (default: {})'.format(default_nameserver))
     group.add_argument('--system-nameservers', action='store_true',
-            help='use system nameservers')
+                       help='use system nameservers')
     group.add_argument('-u', '--udp', action='store_true',
-            help='use udp instead of tcp to resolve domains')
+                       help='use udp instead of tcp to resolve domains')
 
     group = parser.add_argument_group('threading arguments')
     group.add_argument('-t', '--max-threads', type=int, default=default_max_threads,
-            help='maximum number of threads to use at once (default: {})'.format(default_max_threads))
+                       help='maximum number of threads to use at once (default: {})'.format(default_max_threads))
 
     group = parser.add_argument_group('output arguments')
     group.add_argument('-o', '--output', help='tee output to a file')
@@ -244,6 +244,7 @@ def main():
                 # add domain info
                 out += ' ({})'.format(' '.join(parent_domains[ip]))
             utils.log(out)
+
 
 if __name__ == '__main__':
     main()
