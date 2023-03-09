@@ -61,6 +61,7 @@ known_domains = {
     '.topdns.com': 'internetbs',
     '.megamailservers.com': 'internetnamesforbusiness',
     '.mail.ru': 'mail.ru',
+    '.mailgun.org': 'mailgun',
     '.mailinator.com': 'mailinator',
     '.cloudfilter.net': 'mailprotector',
     '.mimecast-offshore.com': 'mimecast',
